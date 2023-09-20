@@ -1,10 +1,8 @@
 local file_name_pattern = "([%w_]+)%."
-local folder_name_pattern = "([%w_]+)$"
 local extension_pattern = "%.(.+)"
 local directory_pattern = "([%w_]+)/"
 
-local assets = {}
-
+--consider making these work on multiple assets and returning a table of them to be popped?
 local asset_threads = {
     audio = [[
         require("love.sound")
@@ -22,8 +20,6 @@ local asset_threads = {
         love.thread.getChannel("%s"):push({"%s", love.video.newVideoStream("%s"), "%s"})
     ]]
 }
-
-local path_table = {} --for async loading communication between channels
 
 --sync
 
@@ -56,24 +52,24 @@ local function load_font(file_name, path, table)
     })
 end
 
---TODO could remove path_table and have it refer to a path_table stored on the pool?
+--TODO could remove pool.pool.path_table and have it refer to a pool.path_table stored on the pool?
 local function load_image_async(file_name, path, table, pool)
     pool.progress.image.total = pool.progress.image.total + 1
-    path_table[path] = table
+    pool.path_table[path] = table
 
     love.thread.newThread(asset_threads.graphics:format(pool.channels.image, file_name, path, path)):start()
 end 
 
 local function load_audio_async(file_name, path, table, pool)
     pool.progress.audio.total = pool.progress.audio.total + 1
-    path_table[path] = table
+    pool.path_table[path] = table
 
     love.thread.newThread(asset_threads.audio:format(pool.channels.audio, file_name, path, path)):start()
 end
 
 local function load_video_async(file_name, path, table, pool)
     pool.progress.video.total = pool.progress.video.total + 1
-    path_table[path] = table
+    pool.path_table[path] = table
 
     love.thread.newThread(asset_threads.video:format(pool.channels.video, file_name, path, path)):start()
 end
@@ -134,7 +130,9 @@ local function create_pool(callback)
             audio = {complete = 0, total = 0},
             video = {complete = 0, total = 0},
             image = {complete = 0, total = 0}
-        }
+        },
+
+        path_table = {}
     }
 
     table.insert(pools, pool)
@@ -145,12 +143,12 @@ end
 ----------
 
 local channel_loader = {
-    audio = function(audio_pool_progress, channel_name)
+    audio = function(audio_pool_progress, channel_name, pool)
         local data = love.thread.getChannel(channel_name):pop()
 
         while data do
             audio_pool_progress.complete = audio_pool_progress.complete + 1
-            path_table[data[3]][data[1]] = data[2]
+            pool.path_table[data[3]][data[1]] = data[2]
 
             data = love.thread.getChannel(channel_name):pop()
 
@@ -160,13 +158,13 @@ local channel_loader = {
         end
     end,
 
-    image = function(image_pool_progress, channel_name)
+    image = function(image_pool_progress, channel_name, pool)
         local data = love.thread.getChannel(channel_name):pop()
 
         --making this a while loop will load more per frame, but can freeze the main thread
         if data then
             image_pool_progress.complete = image_pool_progress.complete + 1
-            path_table[data[3]][data[1]] = love.graphics.newImage(data[2])
+            pool.path_table[data[3]][data[1]] = love.graphics.newImage(data[2])
 
             if image_pool_progress.complete == image_pool_progress.total then
                 return true
@@ -174,12 +172,12 @@ local channel_loader = {
         end
     end,
 
-    video = function(video_pool_progress, channel_name)
+    video = function(video_pool_progress, channel_name, pool)
         local data = love.thread.getChannel(channel_name):pop()
 
         if data then
             video_pool_progress.complete = video_pool_progress.complete + 1
-            path_table[data[3]][data[1]] = love.graphics.newVideo(data[2])
+            pool.path_table[data[3]][data[1]] = love.graphics.newVideo(data[2])
 
             if video_pool_progress.complete == video_pool_progress.total then
                 return true
@@ -187,6 +185,48 @@ local channel_loader = {
         end
     end
 }
+
+local function load_file(file_path, storage, is_async, pool)
+    local asset_table = storage
+
+    for folder_name in file_path:gmatch(directory_pattern) do
+        asset_table[folder_name] = asset_table[folder_name] or {}
+        asset_table = asset_table[folder_name]
+    end
+
+    local extension = file_path:match(extension_pattern):lower()
+    local file_name = file_path:match(file_name_pattern)
+
+    local load_func = extension_loadfunc[is_async and "async" or "sync"][extension]
+    
+    if load_func then
+        load_func(file_name, file_path, asset_table, pool)
+    end
+end
+
+local function load_impl(path, storage, is_async, pool)
+    local info = love.filesystem.getInfo(path)
+
+    if info then
+        if info.type == "file" then
+            load_file(path, storage, is_async, pool)
+        elseif info.type == "directory" then
+            for _, file in pairs(love.filesystem.getDirectoryItems(path)) do
+                load_impl(path .. "/" .. file, storage, is_async, pool)
+            end
+        end
+    end
+end
+
+local function load_from_table(paths, storage, is_async, pool)
+    for _, path in pairs(paths) do
+        load_impl(path, storage, is_async, pool)
+    end
+end
+
+----------
+
+local assets = {}
 
 function assets.update(dt)
     for i = #pools, 1, -1 do
@@ -200,7 +240,7 @@ function assets.update(dt)
 
             pool_complete = false
 
-            if channel_loader[channel_type](pool.progress[channel_type], channel_name) then
+            if channel_loader[channel_type](pool.progress[channel_type], channel_name, pool) then
                 pool.channels[channel_type] = nil
             end
         end
@@ -215,111 +255,26 @@ function assets.update(dt)
     end
 end
 
-local function load_from_table(table, name_asset_table, is_async, pool)
-    for _, path in pairs(table) do
-        local info = love.filesystem.getInfo(path)
-
-        if info then
-            local asset_table = name_asset_table
-
-            for folder_name in path:gmatch(directory_pattern) do
-                asset_table[folder_name] = asset_table[folder_name] or {}
-                asset_table = asset_table[folder_name]
-            end
-
-            if info.type == "file" then
-                local extension = path:match(extension_pattern):lower()
-                local file_name = path:match(file_name_pattern)
-    
-                print(file_name)
-                local load_func = extension_loadfunc[is_async and "async" or "sync"][extension]
-    
-                if load_func then
-                    load_func(file_name, path, asset_table, pool)
-                end
-            elseif info.type == "directory" then
-                local folder_name = path .. "/"
-                local next_table = {}
-
-                for _, next_path in pairs(love.filesystem.getDirectoryItems(path)) do
-                    next_table[#next_table + 1] = folder_name .. next_path
-                end
-
-                load_from_table(next_table, name_asset_table, is_async, pool)
-            end
-        end
+function assets.load(asset, storage, callback)
+    if type(asset) == "table" then
+        load_from_table(asset, storage, false, nil)
+    else
+        load_impl(asset, storage, false, nil)
     end
-end
-
-local function recursive_load(paths, name_asset_table, is_async, pool)
-    for _, path in pairs(love.filesystem.getDirectoryItems(paths)) do
-        local full_path = paths .. "/" .. path
-        local info = love.filesystem.getInfo(full_path)
-
-        local asset_table = name_asset_table
-
-        for folder_name in full_path:gmatch(directory_pattern) do
-            asset_table[folder_name] = asset_table[folder_name] or {}
-            asset_table = asset_table[folder_name]
-        end
-
-        if info.type == "file" then
-            local extension = path:match(extension_pattern):lower()
-            local file_name = path:match(file_name_pattern)
-
-            local load_func = extension_loadfunc[is_async and "async" or "sync"][extension]
-
-            if load_func then
-                load_func(file_name, full_path, asset_table, pool)
-            end
-        elseif info.type == "directory" then
-            recursive_load(full_path, name_asset_table, is_async, pool)
-        end
-    end
-end
-
-local thing = function(folder_or_filename, table, is_async, pool)
-    if type(folder_or_filename) == "table" then
-        load_from_table(folder_or_filename, table, is_async, pool)
-    else 
-        local info = love.filesystem.getInfo(folder_or_filename)
-
-        if info.type == "file" then
-            local extension = folder_or_filename:match(extension_pattern)
-            local load_func = extension_loadfunc.sync[extension]
-
-            local asset_table = table
-
-            for folder_name in full_path:gmatch(directory_pattern) do
-                asset_table[folder_name] = asset_table[folder_name] or {}
-                asset_table = asset_table[folder_name]
-            end
-
-            if load_func then
-                local extension = folder_or_filename:match(extension_pattern):lower()
-                local file_name = folder_or_filename:match(file_name_pattern)
-                local path = folder_or_filename
-
-                load_func(file_name, path, asset_table)
-            end
-        elseif info.type == "directory" then
-            recursive_load(folder_or_filename, table, is_async, pool)
-        end
-    end
-end
-
-function assets.load(folder_or_filename, table, callback)
-    thing(folder_or_filename, table, false, nil)
 
     if callback then
         callback()
     end
 end
 
-function assets.load_async(folder_or_filename, table, callback)
+function assets.load_async(asset, storage, callback)
     local pool = create_pool(callback)
 
-    thing(folder_or_filename, table, true, pool)
+    if type(asset) == "table" then
+        load_from_table(asset, storage, true, pool)
+    else
+        load_impl(asset, storage, true, pool)
+    end
 
     return setmetatable({}, {
         __index = function(t, k)
@@ -338,14 +293,11 @@ end
 
 return assets
 
---handle freeing resources with weak table as optional?, if its not in the table, try to load it? way to clear it out, progress checks?
---linking the table to the root file
---when loading, only load it if its NOT there
---also way to unload data?
---way to mark data as please unload this? 
-
---master table for storing assets? when unloading call release, nil out the thing
---have it unload by passing a path?
---or a folder
---or table or paths
---or table of paths and directories
+--[[
+	way to add your own custom loaders for your own datatypes
+	global resource lookup
+	hand them reference of file if it exists instead of reloading asset
+	store path_table on pool
+	index metamethod for the asset_table with path baked in, so when u unload and nil out the global resource, its gone!
+	proceese functions to run callbakc for each specific asset type?? to generate animations or set imageFilter or something
+]]
