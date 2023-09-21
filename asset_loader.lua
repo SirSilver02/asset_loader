@@ -228,7 +228,9 @@ end
 
 local assets = {}
 
-function assets.update(dt)
+local asset_loader = {}
+
+function asset_loader.update(dt)
     for i = #pools, 1, -1 do
         local pool = pools[i]
         local pool_complete = true
@@ -255,9 +257,9 @@ function assets.update(dt)
     end
 end
 
-function assets.load(asset, storage, callback)
+function asset_loader.load(asset, callback)
     if type(asset) == "table" then
-        load_from_table(asset, storage, false, nil)
+        load_from_table(asset, assets, false, nil)
     else
         load_impl(asset, storage, false, nil)
     end
@@ -267,13 +269,13 @@ function assets.load(asset, storage, callback)
     end
 end
 
-function assets.load_async(asset, storage, callback)
+function asset_loader.load_async(asset, callback)
     local pool = create_pool(callback)
 
     if type(asset) == "table" then
-        load_from_table(asset, storage, true, pool)
+        load_from_table(asset, assets, true, pool)
     else
-        load_impl(asset, storage, true, pool)
+        load_impl(asset, assets, true, pool)
     end
 
     return setmetatable({}, {
@@ -287,17 +289,73 @@ function assets.load_async(asset, storage, callback)
     })
 end
 
-function assets.unload()
-    
+local function unload_file(file_path)
+    local file_name = file_path:match(file_name_pattern)
+    local assets = assets
+
+    for directory in file_path:gmatch(directory_pattern) do
+        assets = assets[directory]
+        assert(assets, string.format("Directory '%s' does not exist to unload from.", directory))
+    end
+
+    local asset = assets[file_name]
+
+    if asset then 
+        if asset.release then
+            asset:release()
+        end
+
+        --if its a font table
+        if type(asset) == "table" then
+            for size, font in pairs(asset) do
+                font:release()
+            end
+        end
+
+        assets[file_name] = nil
+    end
 end
 
-return assets
+local function unload_directory(directory)
+    for _, path in pairs(love.filesystem.getDirectoryItems(directory)) do
+        local full_path = directory .. "/" .. path
+        local info = love.filesystem.getInfo(full_path)
 
---[[
-	way to add your own custom loaders for your own datatypes
-	global resource lookup
-	hand them reference of file if it exists instead of reloading asset
-	store path_table on pool
-	index metamethod for the asset_table with path baked in, so when u unload and nil out the global resource, its gone!
-	proceese functions to run callbakc for each specific asset type?? to generate animations or set imageFilter or something
-]]
+        if info.type == "file" then
+            unload_file(full_path)
+        elseif info.type == "directory" then
+            unload_directory(full_path)
+        end
+    end
+end
+
+local function unload_impl(path)
+    local info = love.filesystem.getInfo(path)
+
+    if info.type == "file" then
+        unload_file(path)
+    elseif info.type == "directory" then
+        unload_directory(path)
+    end
+end
+
+local function unload_table(table)
+    for _, path in pairs(table) do
+        if type(path) == "table" then
+            unload_table(path)
+        else
+            unload_impl(path)
+        end
+    end 
+end
+
+--TODO, unloading fonts
+function asset_loader.unload(asset)
+    if type(asset) == "table" then
+        unload_table(asset)
+    else
+        unload_impl(asset)
+    end
+end
+
+return {asset_loader = asset_loader, assets = assets}
