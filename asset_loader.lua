@@ -261,7 +261,7 @@ function asset_loader.load(asset, callback)
     if type(asset) == "table" then
         load_from_table(asset, assets, false, nil)
     else
-        load_impl(asset, storage, false, nil)
+        load_impl(asset, assets, false, nil)
     end
 
     if callback then
